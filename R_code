@@ -1,0 +1,537 @@
+## CREATE TAXONOMY FILE: make sure that each ASV identifier is attached to only one taxon; filter with percent identity and evalue
+library(dplyr)
+
+tax_id1 = read.delim("~/Desktop/nemabiome.real.redux/mergedtax.txt", stringsAsFactors = FALSE, row.names = NULL)
+
+# get unique taxonomic ids
+uni_tax = select(tax_id1, taxid)
+uni_tax_nondup = unique(uni_tax)
+
+# export as csv to match up tax IDs to names with ncbi taxonomy finder
+write.csv(uni_tax_nondup, "~/Desktop/nemabiome.real.redux/unique_tax.csv")
+
+# read in matched IDs
+taxes = read.delim("~/Desktop/nemabiome.real.redux/tax_report_all.txt", stringsAsFactors = FALSE, row.names = NULL)
+taxes[ ,c('code', 'X.', 'X..1', 'X..2')] = list(NULL)
+
+# merge taxonomic info with hit file
+ds = merge(tax_id1, taxes)
+save(ds, file = "pre-filtering.RData")
+
+# hist of evalues to see if there's a natural cutoff; there is. 
+hist(-log10(ds$evalue),100)
+hist(ds$evalue,100)
+
+# hist of percent identities; again, a natural cutoff
+hist(ds$pid,100)
+
+## filter
+tax_filtered = as_tibble(ds) %>% dplyr::filter(evalue<10^-100 & pident >85 & (grepl('^Trichostrongylus',taxname) | grepl('^Oesophagostomum',taxname) | grepl('^Hyostrongylus',taxname) | grepl('^Strongyloides',taxname) | grepl('Haemonchus',taxname) | grepl('^Cyathostominae',taxname)))
+tax_filtered = tax_filtered[order(tax_filtered$ASV,tax_filtered$taxname),]
+
+# resolve ASV taxonomic matches
+asvs_done = names(which(tapply(tax_filtered$taxname,tax_filtered$ASV,function(x) length(unique(x)) == 1)))
+asvs_done_meta = subset(tax_filtered,ASV %in% asvs_done) %>% select(ASV,taxname) %>% unique # 222 (74 unique)
+asvs_todo = subset(tax_filtered,!ASV %in% asvs_done) # 3,423
+asvs_todo.split = split(asvs_todo,asvs_todo$ASV)
+
+# RULES: 1) if one of the mismatches is Cynathanemostominae, collapse to the other species matched. 2) if two different species within the same genus, then call Genus sp.
+
+# Make Genus column and then redo the matching steps
+asvs_todo$Genus = gsub("([A-Za-z]+).*", "\\1", asvs_todo$taxname)
+
+# identify the ones that are done (ie collapsed in together, all identical)
+asvs_todo_genera = names(which(tapply(asvs_todo$Genus,asvs_todo$ASV,function(x) length(unique(x)) == 1)))
+asvs_genera_done_meta = subset(asvs_todo,ASV %in% asvs_todo_genera) %>% select(ASV, Genus) %>% unique # 722
+asvs_genera_todo = subset(asvs_todo,!ASV %in% asvs_todo_genera) # 989. This one has the ones that don't agree on the genus level
+
+# all of the remaining conflicts are because of Cyathostominae. So we remove that, and then it should be Oesophagostomum all the way and no more conflicts
+asvs_genera_todo_almost = subset(asvs_genera_todo, !Genus=="Cyathostominae")
+
+# so now we can just get a unique line for each 
+soclose_genus = asvs_genera_todo_almost %>% distinct(ASV,Genus) #287 rows/unique ASVs OK BITCHES GETTING CLOSER
+
+# change the Genus column to taxname in soclose_genus and asvs_genera_done_meta in order to rbind
+colnames(soclose_genus)[colnames(soclose_genus)=="Genus"] <- "taxname"
+colnames(asvs_genera_done_meta)[colnames(asvs_genera_done_meta)=="Genus"] <- "taxname"
+
+## now we have to merge all of the unique ASV-taxonomic combos into one reftax df
+tax_def = rbind(soclose_genus, asvs_genera_done_meta, asvs_done_meta) # 1143 rows/unique ASVs, 7 taxa (H. contortus, H. placei, Hyostrongylus Rubidus, Oesophagostomum, O. bifircum, Trichostrongylus, T. vitrinus)
+
+# now make reference taxonomy file
+write.csv(tax_def, "~/Desktop/nemabiome.real.redux/reference.taxonomy.1031.csv")
+
+## in bbedit, make it into the required format and as a text doc
+taxref = read.delim("~/Desktop/nemabiome.real.redux/Reftax_1031.txt")
+
+# col to rownames
+taxref2 = tibble::column_to_rownames(taxref, "Feature.ID")
+
+### PHYLOSEQ ###
+library(qiime2R)
+library(phyloseq)
+library(lubridate)
+library(plyr)
+
+# hit table
+table.redux = read_qza("~/Desktop/nemabiome.real.redux/table.qza")
+otu_2 = as.matrix(table.redux$data)
+write.csv(otu_2, "~/Desktop/nemabiome.real.redux/otu_redux.csv")
+
+# tree situation
+its2_tree = read_tree("~/Desktop/nemabiome.real.redux/rootedtree.nwk")
+
+# metadata
+meta = read.csv("~/Desktop/nemabiome.real/meta.full.csv", stringsAsFactors=FALSE)
+
+# filter to only the OTUs that match 
+table.redux$data=table.redux$data[rownames(taxref2),]
+
+## transform its2_table into otu_table (phyloseq object)
+otutab.redux = otu_table(table.redux$data, taxa_are_rows = TRUE, errorIfNULL = TRUE)
+
+## transform its2_metadata into sample_data
+meta.table = sample_data(meta, errorIfNULL = TRUE)
+rownames(meta.table) = meta.table$id
+
+## transform its2_reftax into tax_table
+taxtab = as.matrix(taxref2) # first make the tax file a matrix, otherwise taxa_names gets all fucked up
+#taxtab1 = taxtab[,-1]
+#rownames(taxtab1) = taxtab[,1]
+taxtab2 = tax_table(taxtab) # make tax_table
+
+# make into physeq object
+physeq.redux = phyloseq(otutab.redux, taxtab2, meta.table, its2_tree)
+
+## plot distribution of parasite families
+plot_bar(physeq.redux, fill = "Genus", facet_grid = ~Genus)
+
+# check for samples with low/no reads
+min(apply(physeq.redux@otu_table,2,sum)) # 0 minumum reads
+sum(apply(physeq.redux@otu_table,2,sum)==0) #30 samples
+
+# remove those samples
+ps = prune_samples(sample_sums(physeq.redux) > 0, physeq.redux)
+sum(apply(ps@otu_table,2,sum)==0) #0 samples
+
+# build tree plots with new combined data
+plot_tree(ps, label.tips="Species", color = "SITE", ladderize="left", plot.margin=0.01)
+
+# make heatmap
+plot_heatmap(ps)
+
+##### setting threshold @ 500 reads in at least 10% of samples within each site ##### 
+
+# first prune sample to only each site$
+sk.smp.redux = subset_samples(ps, SITE == "SK")
+ch.smp.redux = subset_samples(ps, SITE == "CH")
+ll.smp.redux = subset_samples(ps, SITE == "LL")
+
+# prune to only those that show up in 10% of samples @ over 500 reads
+sk.smp.redux.trim = filter_taxa(sk.smp.redux, function(x) quantile(x,0.9) > 500, prune = TRUE) # in sk
+ch.smp.redux.trim = filter_taxa(ch.smp.redux, function(x) quantile(x,0.9) > 500, prune = TRUE) # in ch
+ll.smp.redux.trim = filter_taxa(ll.smp.redux, function(x) quantile(x,0.9) > 500, prune = TRUE) # in ll
+
+# first make otu tables into matrices
+sk.smp.redux.df = as.data.frame(otu_table(sk.smp.redux.trim))
+sk.smp.redux.df = setDT(sk.smp.redux.df, keep.rownames = TRUE)[]
+colnames(sk.smp.redux.df)[1] = "ASV"
+
+ch.smp.redux.df = as.data.frame(otu_table(ch.smp.redux.trim))
+ch.smp.redux.df = setDT(ch.smp.redux.df, keep.rownames = TRUE)[]
+colnames(ch.smp.redux.df)[1] = "ASV"
+
+ll.smp.redux.df = as.data.frame(otu_table(ll.smp.redux.trim))
+ll.smp.redux.df = setDT(ll.smp.redux.df, keep.rownames = "ASV")[]
+colnames(ll.smp.redux.df)[1] = "ASV"
+
+merge.redux = merge(ch.smp.redux.df,sk.smp.redux.df, by='ASV',all.x = TRUE)
+merge.redux.trim = merge(merge.redux, ll.smp.redux.df,by='ASV', all.x = TRUE)
+
+# make NAs 0s instead
+merge.redux.trim[is.na(merge.redux.trim)] = 0
+
+# make col 1 row names instead
+merge.redux.trim = merge.redux.trim %>% remove_rownames %>% column_to_rownames(var="ASV")
+
+# find taxa that match in order to subset taxonomy table
+include_list = rownames(merge.redux.trim) # 15 taxa
+
+# now have to make this into an otutable and then make a new phyloseq object and start over
+## transform into otu_table (phyloseq object)
+otutab.new.redux = otu_table(merge.redux.trim, taxa_are_rows = TRUE, errorIfNULL = TRUE)
+taxa_names(otutab.new.redux) = include_list
+
+# filter tax table to only OTUs that match
+trim.taxa.redux = subset(taxtab2, rownames(taxtab2) %in% include_list)
+
+## transform its2_reftax into tax_table
+trim.tax.redux = as.matrix(trim.taxa.redux) # first make the tax file a matrix
+taxtab.trim.redux = tax_table(trim.tax.redux) # make tax_tabl
+
+# rebuild phyloseq object with all of the basic objects
+physeq.trim.redux = phyloseq(otutab.new.redux, taxtab.trim.redux, meta.table, its2_tree)
+
+# Remove any samples with no reads
+min(apply(physeq.trim.redux@otu_table,2,sum))# 2 minumum reads
+max(apply(physeq.trim.redux@otu_table,2,sum)) # 2046246
+rowSums(physeq.trim.redux@otu_table)
+colSums(physeq.trim.redux@otu_table)
+
+# heatmap
+plot_heatmap(physeq.trim.redux, sample.order = "SITE")
+
+### FILTER AGAIN BECAUSE WE HAVE SOME REALLY LOW READS/BIMODAL DISTRIBUTION. THRESHOLD AT LOG10^3 aka 1000 reads and then do all the models and comparisons again 
+
+# Remove any samples with fewer than 1,000 reads from physeq.trim, turn it into physeq.trim.trim
+min(apply(physeq.trim.redux@otu_table,2,sum)) # 2 minumum reads
+sum(apply(physeq.trim.redux@otu_table,2,sum) < 1000) #62
+physeq.trim.trim = prune_samples(sample_sums(physeq.trim.redux) >= 1000, physeq.trim.redux)
+rowSums(physeq.trim.trim@otu_table)
+hist(log(rowSums(physeq.trim.trim@otu_table)))
+
+# heatmap
+plot_heatmap(physeq.trim.trim, sample.order = "SITE") #305 samples, 15 ASVs
+
+# make into df. this df now has a row for every taxon in every sample (ie triplicated rows or whatever)
+omg.trim = psmelt(physeq.trim.trim)
+hist(unique(log10(omg.trim$Abundance)))
+table(omg.trim$SITE)     
+nrow(omg.trim) #4575
+length(unique(omg.trim$OTU)) #15
+length(unique(omg.trim$Sample)) #305
+
+## remove non gellies
+omg.trim = omg.trim[!omg.trim$ind == "JACKAL",]
+
+# simplify df
+trim.simple = subset(omg.trim, select = c("OTU", "Sample", "Abundance", "source", "ind", "col.year", "Type", "Sex", "age", "SITE", "age.cat", "Genus", "Species"))
+
+# if abundance is 1 and it's a cc, put 1 in CC pres
+trim.simple$CC.Pres = ifelse(((trim.simple$Abundance > 0) &
+                                (trim.simple$Type == "C")),
+                             1,  # if condition is met, put 1
+                             0   # else put 0
+)
+
+# if abundance is 1 and it's a F, put 1 in F pres
+trim.simple$F.Pres = ifelse(((trim.simple$Abundance > 0) &
+                               (trim.simple$Type == "F")),
+                            1,  # if condition is met, put 1
+                            0   # else put 0
+)
+
+##### make all possible combos
+ccs = trim.simple[trim.simple$Type == "C",]
+fs = trim.simple[trim.simple$Type == "F",]
+cc_ids = unique(ccs$Sample)
+fec_ids = unique(fs$Sample)
+asv = unique(trim.simple$OTU)
+wut.trim = expand.grid(cc_ids, fec_ids, asv)
+names(wut.trim)[names(wut.trim) == 'Var1'] = 'CC_id'
+names(wut.trim)[names(wut.trim) == 'Var2'] = 'F_id'
+names(wut.trim)[names(wut.trim) == 'Var3'] = 'ASV'
+wut.trim$F_id = as.character(wut.trim$F_id)
+
+scary = subset(trim.simple, select=c("Sample", "OTU", "Abundance", "Type", "CC.Pres", "F.Pres"))
+
+fecal = subset(scary,Type == 'F')[c('Sample','OTU', "F.Pres")]
+copro = subset(scary, Type == 'C')[c('Sample','OTU',"CC.Pres")]
+
+trimerge = merge(wut.trim,fecal,by.x=c('F_id','ASV'),by.y=c('Sample','OTU'),all.x=TRUE)
+trimerge = merge(trimerge,copro,by.x=c('CC_id','ASV'),by.y=c('Sample','OTU'),all.x=TRUE)
+
+# get paired list
+pairyn = read.csv("~/Desktop/nemabiome.real/Paired_list.csv", stringsAsFactors = FALSE)
+pairyn$Paired = TRUE
+trimerge.2 = merge(trimerge,pairyn,by=c('CC_id','F_id'),all.x=TRUE) 
+trimerge.2$Paired[is.na(trimerge.2$Paired)] = 0
+
+# table
+table(trimerge.2$Paired) # 225 paired, 212925 unpaired. 225/15 = 15
+
+# now sum to get library size
+abun.sum = trim.simple %>% 
+  dplyr::group_by(Sample, Genus ) %>% 
+  dplyr::summarize(Abundance = sum(Abundance))
+
+# reshape
+trimdfsum.redux = abun.sum %>% spread(Genus, Abundance, fill = NA, convert = FALSE)
+
+# add total library size
+trimdfsum.redux$library.size = trimdfsum.redux$Oesophagostomum + trimdfsum.redux$Trichostrongylus
+
+# add cc library size and fecal library size
+abun.sum.trim.1 = subset(trimdfsum.redux, select= c("Sample", "library.size"))
+names(abun.sum.trim.1)[names(abun.sum.trim.1) == 'Sample'] = 'F_id'
+
+an = merge(trimerge.2, abun.sum.trim.1, by="F_id")
+
+names(abun.sum.trim.1)[names(abun.sum.trim.1) == 'F_id'] = 'CC_id'
+amp = merge(an, abun.sum.trim.1, by="CC_id")
+
+dm.trim = glmer( CC.Pres ~ Paired*F.Pres + (1|ASV), data=amp, family="binomial") 
+summary(dm.trim)
+
+########### ########### ########### THIS IS PSR ########### ########### ########### 
+
+## get PSR info from trim.simple 
+trim.simple$PA = NA
+trim.simple$PA[trim.simple$Abundance > 1] = 1
+trim.simple$PA[trim.simple$Abundance < 1] = 0
+
+# select on relevant columns 
+newt.sub = subset(trim.simple, select=c("Sample", "OTU", "Abundance", "ind", "Type","age.cat", "age","SITE", "Sex"))
+
+newt.sub$PA = NA
+newt.sub$PA[newt.sub$Abundance > 1] = 1
+newt.sub$PA[newt.sub$Abundance < 1] = 0
+newt.sub2 = subset(newt.sub, select=c("Sample", "OTU", "ind", "Type","age.cat", "age","SITE", "Sex", "PA"))
+
+newt.trim = newt.sub2 %>% spread(key = OTU , value = PA)
+
+# rename columns 
+names(newt.trim) <- c("Sample", "ind", "Type", "age.cat", "age", "site", "Sex", "Os.T1", "Ts.T2", "Ts.T3", "Tv.T4", "Ts.T5", "Ts.T6","Os.T7","Ts.T8", "Os.T9", "Ts.T10", "Os.T11", "Ts.T12", "Os.T13", "Ts.T14", "Os.T15")
+
+# calculate PSR
+newt.trim$PSR = rowSums(newt.trim[, c(8:22)])
+
+# remove non-gellies and fix blank sex in newt.trim.2
+newt.trim.2 = newt.trim[!(newt.trim$ind=="JACKAL"),]
+newt.trim.2$Sex[newt.trim.2$Sex == ""] <- "UN"
+
+## THE ORDER OF ASVS IN NEWT.TRIM.2 is: "02bdeeb773faaa75a02c50295db44419" "0b0b6dc590113c5ed311898cd8306978" "225e20dae695e83fa342bf48fb9f1201" "250f267d2004d12c34aeb73352761a31" "2be4485d4eccdb412662bd6a7d53b3aa" "3b2ae267f450051ddf510bc94d68fe4f" "5404b70f7b2d36edf432b3b521418038" "58d00b803ba9e015a158572e9df1624f" "6254949475765b7392fc4a526602c1cb" "73a98210375a6b35be18ce24a6226231" "86f1f75d3942f78182a53c4be2be9ec1" "8a7d8fcc3757a9cf00d4f93ffb0704e5" "8de4594cd9b7b0a8096a7e3c72bbed9d" "92878f77a56d457126ad27afde655485" "b8a2612757e852377898260da93fbb0d"
+
+## summary
+length(unique(newt.trim.2$Sample)) #303
+table(newt.trim.2$Sex) # 173 females, 112 males, and 18 UN
+table(newt.trim.2$age.cat) #   A   I   J  UN 
+# 250   7  33  13
+
+## calculate prevalence per ASV per site.
+thisissk = newt.trim.2[newt.trim.2$site == "SK",] #235
+thisisch = newt.trim.2[newt.trim.2$site == "CH",] #59
+thisisll = newt.trim.2[newt.trim.2$site == "LL",] #9
+
+vn = as.data.frame(colSums(thisissk[,c(8:22)]))
+vn$total = 235
+vn$perc = (vn$`colSums(thisissk[, c(8:22)])`/vn$total)*100
+asvnames = c("02bdeeb773faaa75a02c50295db44419", "0b0b6dc590113c5ed311898cd8306978", "225e20dae695e83fa342bf48fb9f1201", "250f267d2004d12c34aeb73352761a31", "2be4485d4eccdb412662bd6a7d53b3aa", "3b2ae267f450051ddf510bc94d68fe4f" ,"5404b70f7b2d36edf432b3b521418038" ,"58d00b803ba9e015a158572e9df1624f", "6254949475765b7392fc4a526602c1cb" ,"73a98210375a6b35be18ce24a6226231" ,"86f1f75d3942f78182a53c4be2be9ec1" ,"8a7d8fcc3757a9cf00d4f93ffb0704e5", "8de4594cd9b7b0a8096a7e3c72bbed9d", "92878f77a56d457126ad27afde655485", "b8a2612757e852377898260da93fbb0d")
+vn = cbind(vn, asvnames)
+
+pn = as.data.frame(colSums(thisisll[,c(8:22)]))
+pn$total = 9
+pn$perc = (pn$`colSums(thisisll[, c(8:22)])`/pn$total)*100
+asvnames = c("02bdeeb773faaa75a02c50295db44419", "0b0b6dc590113c5ed311898cd8306978", "225e20dae695e83fa342bf48fb9f1201", "250f267d2004d12c34aeb73352761a31", "2be4485d4eccdb412662bd6a7d53b3aa", "3b2ae267f450051ddf510bc94d68fe4f" ,"5404b70f7b2d36edf432b3b521418038" ,"58d00b803ba9e015a158572e9df1624f", "6254949475765b7392fc4a526602c1cb" ,"73a98210375a6b35be18ce24a6226231" ,"86f1f75d3942f78182a53c4be2be9ec1" ,"8a7d8fcc3757a9cf00d4f93ffb0704e5", "8de4594cd9b7b0a8096a7e3c72bbed9d", "92878f77a56d457126ad27afde655485", "b8a2612757e852377898260da93fbb0d")
+pn = cbind(pn, asvnames)
+
+cn = as.data.frame(colSums(thisisch[,c(8:22)]))
+cn$total = 59
+cn$perc = (cn$`colSums(thisisch[, c(8:22)])`/cn$total)*100
+asvnames = c("02bdeeb773faaa75a02c50295db44419", "0b0b6dc590113c5ed311898cd8306978", "225e20dae695e83fa342bf48fb9f1201", "250f267d2004d12c34aeb73352761a31", "2be4485d4eccdb412662bd6a7d53b3aa", "3b2ae267f450051ddf510bc94d68fe4f" ,"5404b70f7b2d36edf432b3b521418038" ,"58d00b803ba9e015a158572e9df1624f", "6254949475765b7392fc4a526602c1cb" ,"73a98210375a6b35be18ce24a6226231" ,"86f1f75d3942f78182a53c4be2be9ec1" ,"8a7d8fcc3757a9cf00d4f93ffb0704e5", "8de4594cd9b7b0a8096a7e3c72bbed9d", "92878f77a56d457126ad27afde655485", "b8a2612757e852377898260da93fbb0d")
+cn = cbind(cn, asvnames)
+
+# plot
+newt.trim.2$site = relevel(as.factor(newt.trim.2$site), ref = "CH")
+r = ggplot(newt.trim.2, aes(x=site, y= PSR, fill=site)) + 
+  geom_boxplot() + theme_classic() + scale_fill_brewer(palette = "Spectral") 
+r + scale_fill_manual(values = c("#a6d29b","#fffec5", "#ee9265")) + geom_quasirandom() + xlab("site") + ylab("ASV richness") + theme(legend.position = "none")
+
+## MODEL 10.8.19. Without interaction, some demographic predictors are significant. Site significant (Chenek has more ASVs)
+newt.trim.2$site = as.factor(newt.trim.2$site)
+newt.trim.2$site = relevel(newt.trim.2$site, ref = "SK")
+sal.mod = lmer(log(PSR) ~ site + (1|ind), data = newt.trim.2)
+summary(sal.mod)
+
+newt.trim.2$site = relevel(newt.trim.2$site, ref = "LL")
+sal.mod.ll = lmer(log(PSR) ~ site + (1|ind), data = newt.trim.2)
+summary(sal.mod.ll)
+
+newt.trim.2$site = relevel(newt.trim.2$site, ref = "CH")
+sal.mod.ch = lmer(log(PSR) ~ site + (1|ind), data = newt.trim.2)
+summary(sal.mod.ch)
+
+sal.mod.2 = lmer(log(PSR) ~ age.cat*Sex + (1|ind), data = newt.trim.2)
+summary(sal.mod.2)
+
+## now have to remove the three that only exist in CH to see if pattern still holds. T3 ("225e20dae695e83fa342bf48fb9f1201"), T14 ("92878f77a56d457126ad27afde655485")
+
+# sankaber does not have T3, T14.  T1  T2  T3  T4  T5  T6  T7  T8  T9 T10 T11 T12 T13 T14 T15 
+                                  # 84 106   0  49 198 138  76  79 115 200 132 113  82   0 224 
+vsk = newt.trim.2[newt.trim.2$site == "SK",]
+colSums(vsk[,c(8:22)])
+
+## LL does not have T3 or T14 either  T1  T2  T3  T4  T5  T6  T7  T8  T9 T10 T11 T12 T13 T14 T15 
+                                    # 0   6   0   0   6   7   0   0   8   8   0   4   0   0   9 
+vll = newt.trim.2[newt.trim.2$site == "LL",]
+colSums(vll[,c(8:22)])
+
+# Chenek has them all # T1  T2  T3  T4  T5  T6  T7  T8  T9 T10 T11 T12 T13 T14 T15 
+                      # 26  53  15  39  55  54  26  34  40  54  37  48  30  18  59
+vch = newt.trim.2[newt.trim.2$site == "CH",]
+colSums(vch[,c(8:22)])
+
+## while we're at it, let's calculate ASV prevalence
+colSums(newt.trim.2[,c(8:22)])
+
+#T1  T2  T3  T4  T5  T6  T7  T8  T9 T10 T11 T12 T13 T14 T15 
+#110 165  15  88 259 199 102 113 163 262 169 165 112  18 292
+
+## and also genus prevalence. Oes: 296/303 (97.7%), Trich: 299/303 (98.7%)
+genus.prev = trimdfsum.redux
+genus.prev$Oesophagostomum = as.logical(genus.prev$Oesophagostomum)
+genus.prev$Trichostrongylus = as.logical(genus.prev$Trichostrongylus)
+
+dropsrag <- c("T3","T14")
+ragh = newt.trim.2[ , !(names(newt.trim.2) %in% dropsrag)]
+
+# run model again. yes it does hold. Chenek monkeys have more ASVs even not counting the ones that only appear in Chenek
+
+woken = lmer(log(PSR) ~ site + (1|ind), data = ragh)
+summary(woken)
+
+# relevel
+newt.trim.2$site = relevel(newt.trim.2$site, ref = "LL")
+sal.mod.3 = lmer(log(PSR) ~ site + (1|ind), data = newt.trim.2)
+summary(sal.mod.3)
+
+## I remember. We want to separate out the richness and demography so that we're just looking at known individuals with known ages and sexes.
+
+newt.sk = newt.trim.2[newt.trim.2$site == "SK",]
+nrow(newt.sk) #235
+table(newt.sk$Sex) # F 144, M 91
+table(newt.sk$age.cat) # A 213, I 5, J 17
+
+# model 
+sal.mod.4 = lmer(log(PSR) ~ age*Sex + (1|ind), data = newt.sk)
+summary(sal.mod.4)
+
+##### THIS IS ABUNDANCE ######
+##### Generalized Linear Mixed Models: Demography and Abundance #####
+## CALCULATE SIZE FACTORS
+ddsnew.trim = phyloseq_to_deseq2(physeq.trim.trim, ~ SITE)
+ddsnew.trim = estimateSizeFactors(ddsnew.trim,type="poscounts")
+diagddsnew.trim = DESeq(ddsnew.trim, fitType="local")
+res.trim = results(diagddsnew.trim)
+SF.trim = data.frame(sizeFactors(ddsnew.trim))
+SF.trim$LID = rownames(SF.trim)
+colnames(SF.trim)[1]<-"SF"
+SF.trim$Sample = SF.trim$LID
+
+# add abundances scaled
+trimple = merge(trim.simple, SF.trim, by="Sample", keep = TRUE)
+trimple$abundance.scaled = with(trimple,Abundance/SF)
+
+### Abundance analysis by site loop. See Abundance.models.txt for each model 
+abundance.analysis.trim = lapply(unique(trimple$OTU),function(i) {
+  this = droplevels(subset(trimple, OTU %in% i))
+  this$SITE = factor(this$SITE)
+  m1 = try(glmmTMB(Abundance ~ SITE + (1|ind) + (1|SF), data = this, ziformula = ~1, family="nbinom2"()))
+  if (class(m1) == 'try-error') {
+    out = data.frame(taxon=i,pval.sitell=NA,pval.sitesk=NA,coef.sitell=NA,coef.sitesk=NA)
+  } else {
+    pval.sitell = summary(m1)$coefficients$cond[,'Pr(>|z|)'][c('SITELL')]
+    pval.sitesk = summary(m1)$coefficients$cond[,'Pr(>|z|)'][c('SITESK')]
+    coef.sitell = summary(m1)$coefficients$cond[,'Estimate'][c('SITELL')]
+    coef.sitesk = summary(m1)$coefficients$cond[,'Estimate'][c('SITESK')]
+    pSite = drop1(m1,test="Chisq")[['Pr(>Chi)']][2]
+    out = data.frame(taxon=i,pval.sitell,pval.sitesk,coef.sitell,coef.sitesk)
+  }
+  out
+})
+
+# do.call
+abundances.trim = do.call(rbind,abundance.analysis.trim)
+
+## now do just SK and CH without ASVs that only appear in CH
+
+itsnew = subset(trimple, SITE != "LL")
+itsnew2 = subset(itsnew, OTU != "225e20dae695e83fa342bf48fb9f1201")
+itsnew2 = subset(itsnew2, OTU != "92878f77a56d457126ad27afde655485")
+
+abundance.analysis.trim = lapply(unique(itsnew2$OTU),function(i) {
+  this = droplevels(subset(itsnew2, OTU %in% i))
+  this$SITE = factor(this$SITE)
+  m1 = try(glmmTMB(Abundance ~ SITE + (1|ind) + (1|SF), data = this, ziformula = ~1, family="nbinom2"()))
+  if (class(m1) == 'try-error') {
+    out = data.frame(taxon=i,pval.sitell=NA,pval.sitech=NA,coef.sitell=NA,coef.sitech=NA)
+  } else {
+    pval.sitesk = summary(m1)$coefficients$cond[,'Pr(>|z|)'][c('SITESK')]
+    coef.sitesk = summary(m1)$coefficients$cond[,'Estimate'][c('SITESK')]
+    out = data.frame(taxon=i,pval.sitesk,coef.sitesk)
+  }
+  out
+})
+
+# do.call
+abundances.trim = do.call(rbind,abundance.analysis.trim)
+
+#p1 = unlist(select(abundances.trim, pval.sitesk))
+#p1.adj = p.adjust(p1, method = "bonferroni")
+abundances.trim$adj_sk = p.adjust(abundances.trim$pval.sitesk, method = "bonferroni")
+abundances.trim$adj_sk = format.pval(pv = abundances.trim$adj_sk, digits = 6)
+write.csv(abundances.trim, "~/Desktop/sitemodelpvalues.csv")
+
+
+## now abundance with demographic predictors
+sal.sk = trimple[trimple$SITE == "SK",] # subset to just SK
+sal.sk = sal.sk[!is.na(sal.sk$age),]
+
+## remove the ASVs that don't appear in SK
+# 225e20dae695e83fa342bf48fb9f1201
+# 92878f77a56d457126ad27afde655485
+
+sal.sk = subset(sal.sk, OTU != "225e20dae695e83fa342bf48fb9f1201")
+sal.sk = subset(sal.sk, OTU != "92878f77a56d457126ad27afde655485")
+
+
+ab.sk.sal = lapply(unique(sal.sk$OTU),function(i) {
+  this = droplevels(subset(sal.sk, OTU %in% i))
+  sk1.sal = try(glmmTMB(log(Abundance + 1) ~ age*Sex + (1|ind) + (1|SF), data = this, ziformula = ~0, family="nbinom2"()))
+  if (class(sk1.sal) == 'try-error') {
+    out = data.frame(taxon=i,pval.age,pval.sex, pval.int, coef.age,coef.sex, coef.int)
+  } else {
+    pval.age = summary(sk1.sal)$coefficients$cond[,'Pr(>|z|)'][c('age')]
+    pval.sex = summary(sk1.sal)$coefficients$cond[,'Pr(>|z|)'][c('SexM')]
+    pval.int = summary(sk1.sal)$coefficients$cond[,'Pr(>|z|)'][c('age:SexM')]
+    coef.age = summary(sk1.sal)$coefficients$cond[,'Estimate'][c('age')]
+    coef.sex = summary(sk1.sal)$coefficients$cond[,'Estimate'][c('SexM')]
+    coef.int = summary(sk1.sal)$coefficients$cond[,'Estimate'][c('age:SexM')]
+    out = data.frame(taxon=i,pval.age,pval.sex, pval.int, coef.age,coef.sex, coef.int)
+  }
+  out
+})
+
+# do.call
+abundances.sk.sal = do.call(rbind,ab.sk.sal)
+abundances.sk.sal$age_adj = p.adjust(abundances.sk.sal$pval.age, method = "bonferroni")
+abundances.sk.sal$sex_adj = p.adjust(abundances.sk.sal$pval.sex, method = "bonferroni")
+write.csv(abundances.sk.sal, "~/Desktop/pvalesdem.csv")
+
+
+
+p2 = unlist(select(abundances.sk.sal, pval.age))
+p2.a = p.adjust(p2, method = "bonferroni")
+p3= unlist(select(abundances.sk.sal, pval.sex))
+p3.a = p.adjust(p3, method = "bonferroni")
+
+
+
+## create the metnodes df for igraph. make sure ASV order matches
+metnodes5 = read.csv("~/Desktop/nemabiome.real.redux/metnodes5.csv", stringsAsFactors = FALSE)
+
+library(igraph)
+library(tidyverse)
+
+a=make_network(physeq.trim.trim, type="taxa", distance="jaccard", max.dist = 0.9,keep.isolates = T)
+
+norm_abundances.new2=metnodes5 %>% 
+  mutate(sk_norm=SK/235,ch_norm=CH/59,ll_norm=LL/9) %>% ## create new columns where it is the proportion of that site's samples that have that ASV
+  select(sk_norm,ch_norm,ll_norm) %>%  ## select only those new normalized columns
+  split(., 1:15) %>% ## split it into a list so each row is it's own item in a list
+  lapply(.,as.numeric) ## convert to numeric (instead of "data.frame")
+
+plot(a, vertex.shape="pie", vertex.pie=norm_abundances.new2,
+     vertex.pie.color=list(c("mediumseagreen","lightsalmon", "lightyellow")), ## blue = SK, yellow = CH, green = LL
+     vertex.size=Reduce(c,lapply(norm_abundances.new2,sum))*8.5, vertex.label=NA, main = "ASV Abundance by Site") ## multiply by 20 to increase the size of hte nodes (so they aren't so tiny). Change this number to get a good image. I think you also need to increase the repelling so that they aren't so close together.)
+
