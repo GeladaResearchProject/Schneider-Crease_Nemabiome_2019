@@ -1,0 +1,119 @@
+# make directory
+mkdir /gscratch/scrubbed/smacklab/iasc
+
+# put LID text file into that folder
+rsync --progress /Users/India/Desktop/nemabiome.real/LIDs.txt iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc
+
+# Generate fastq manifest.csv
+cd /gscratch/scrubbed/smacklab/iasc/ 
+
+for f in `cat LIDs.txt`; do echo $f,`ls /gscratch/scrubbed/smacklab/PID_10089_190927_done/merged_fastqs/${f}*R1*.gz`,"forward"; echo $f,`ls /gscratch/scrubbed/smacklab/PID_10089_190927_done/merged_fastqs/${f}*R2*.gz`,"reverse";done > newmanifest.csv
+
+# Put manifest on Desktop so that I can see it and make sure what's up
+rsync --progress iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/newmanifest.csv /Users/India/Desktop/nemabiome.real.redux/manifestnew.txt 
+
+# Manually remove those LIDs that didn't have any data, and add in header # "sample-id,absolute-filepath,direction"
+
+# Import into Excel (new file, import csv, select 'comma delimited', then import)
+# rsync back to correct folder
+rsync --progress /Users/India/Desktop/nemabiome.real.redux/manifestnew_upload.csv  iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/manifestnew_upload.csv
+
+# make the paired end demux.qza
+module load contrib/qiime2/2019.1
+qiime tools import --type 'SampleData[PairedEndSequencesWithQuality]'  --input-path manifestnew_upload.csv --input-format PairedEndFastqManifestPhred33 --output-path paired-end-demux.qza
+
+# visualize and summarize to decide cutoff/truncations for  next step by making a qzv
+qiime demux summarize --i-data paired-end-demux.qza --o-visualization demux.qzv
+
+# then rsync it to desktop
+rsync --progress iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/demux.qzv /Users/India/Desktop/nemabiome.real.redux/demux.qzv 
+
+# then look at that file on view.qiime.org
+
+#use dada2 to denoise the paired-end.qza file, which somehow also joins pairs. truncate according to above information
+
+qiime dada2 denoise-paired --i-demultiplexed-seqs paired-end-demux.qza --o-table table --o-representative-sequences rep-seqs --p-n-threads 16 --p-trunc-len-f 240 --p-trunc-len-r 240 --output-dir output --o-denoising-stats its2-stats-dada2.qza
+
+qiime metadata tabulate --m-input-file its2-stats-dada2.qza --o-visualization its2-stats-dada2.qzv
+
+	#### Run the above two in a submitted job on the cluster by first typing vi may-qiime.sh into the command line, then enter the stuff that's in that file into that (press i first to insert). And then escape, run :wq. Then run sbatch may-qiime.sh in the command line. squeue -u iasc to check on progress.
+
+# get metadata into the computer
+rsync --progress /Users/India/Desktop/nemabiome.real/metadata4.txt  iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/metadata.txt 
+
+# make table
+qiime feature-table summarize --i-table table.qza --o-visualization table.qzv --m-sample-metadata-file metadata.txt
+
+# sync table to look at it on view.qiime.org
+rsync --progress iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/table.qzv /Users/India/Desktop/nemabiome.real.redux/table.qzv
+
+# and summarize and visualize repseqs.qza file generated from denoising step
+qiime feature-table tabulate-seqs --i-data rep-seqs.qza --o-visualization rep-seqs.qzv
+
+# sync repseq to look at it on view.qiime.org and download fasta file from here
+rsync --progress iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/rep-seqs.qzv /Users/India/Desktop/nemabiome.real.redux/rep-seqs.qzv
+
+#de novo cluster sequences
+qiime vsearch cluster-features-de-novo --i-table table.qza --i-sequences rep-seqs.qza --o-clustered-table table-dn-99.qza --o-clustered-sequences rep-seqs-dn-99.qza --p-perc-identity 0.99
+
+#turn sequences into something we can see
+qiime feature-table tabulate-seqs \
+  --i-data rep-seqs-dn-99.qza \
+  --o-visualization rep-seqs.qzv
+  
+#rsync to Desktop
+  rsync --progress iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/rep-seqs.qzv /Users/India/Desktop/nemabiome.real.redux/rep-seqs.qzv
+
+## strip table of sample with 0 reads to make it acceptable to qiime2R
+qiime feature-table filter-samples \
+--i-table table.qza \
+--p-min-features 1 \
+--o-filtered-table tablenew.qza
+
+#Phylogenetic tree generation with the mafft program
+qiime alignment mafft --i-sequences rep-seqs.qza --o-alignment aligned-rep-seqs.qza  
+
+#masks to remove highly variable positions (denoise)
+qiime alignment mask --i-alignment aligned-rep-seqs.qza --o-masked-alignment masked-aligned-rep-seqs.qza
+
+#FastTree to generate phylotree from the masked alignment file generated from the previous step.
+qiime phylogeny fasttree --i-alignment masked-aligned-rep-seqs.qza --o-tree unrooted-tree.qza
+
+#Root trees
+qiime phylogeny midpoint-root --i-tree unrooted-tree.qza --o-rooted-tree rooted-tree.qza
+
+#rsync all of the files 
+  rsync --progress iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/rooted-tree.qza /Users/India/Desktop/Nemabiome.real/rooted-tree.qza
+
+#rsync all of the files 
+  rsync --progress /Users/India/Desktop/nemabiome.real.redux/sequences.fasta iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/
+  
+#Importing new fasta file into a qza 
+qiime tools import \
+  --type 'FeatureData[Sequence]' \
+  --input-path sequences.fasta \
+  --output-path sequences.qza
+
+# check for module
+module avail
+
+# load blast 
+module load contrib/blast+/2.7.1 
+
+# have to split sequences.fasta into smaller files because it's taking too long to run on the build node
+split -l 500 sequences.fasta split_fastas
+
+# have to leave interactive session to run blast remotely (exit). put code in vi blastn1.sh or whatever. then sbatch blastn1.sh
+
+# now merge
+
+cat firstsplit.out 2split.out 3split.out 4split.out 5split.out 6split.out 7split.out 8split.out 9split.out 10split.out 11split.out 12split.out 13split.out 14split.out 15split.out 16split.out 17split.out 19split.out 20split.out 21split.out 22split.out 23split.out > mergedtax.out
+
+# rsync to desktop and then merge to create reference taxonomy
+rsync --progress iasc@mox.hyak.uw.edu:/gscratch/scrubbed/smacklab/iasc/mergedtax.out /Users/India/Desktop/nemabiome.real.redux/mergedtax.txt
+
+## make tree qza into nwk
+qiime tools export \
+  --input-path rooted-tree.qza \
+  --output-path rootedtree
+  
