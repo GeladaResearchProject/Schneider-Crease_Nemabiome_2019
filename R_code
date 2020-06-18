@@ -95,7 +95,7 @@ meta.table = sample_data(meta, errorIfNULL = TRUE)
 rownames(meta.table) = meta.table$id
 
 ## transform its2_reftax into tax_table
-taxtab = as.matrix(taxref2) # first make the tax file a matrix, otherwise taxa_names gets all fucked up
+taxtab = as.matrix(taxref2) # first make the tax file a matrix
 #taxtab1 = taxtab[,-1]
 #rownames(taxtab1) = taxtab[,1]
 taxtab2 = tax_table(taxtab) # make tax_table
