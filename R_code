@@ -49,7 +49,7 @@ asvs_genera_todo = subset(asvs_todo,!ASV %in% asvs_todo_genera) # 989. This one 
 asvs_genera_todo_almost = subset(asvs_genera_todo, !Genus=="Cyathostominae")
 
 # so now we can just get a unique line for each 
-soclose_genus = asvs_genera_todo_almost %>% distinct(ASV,Genus) #287 rows/unique ASVs OK BITCHES GETTING CLOSER
+soclose_genus = asvs_genera_todo_almost %>% distinct(ASV,Genus) #287 rows/unique ASVs
 
 # change the Genus column to taxname in soclose_genus and asvs_genera_done_meta in order to rbind
 colnames(soclose_genus)[colnames(soclose_genus)=="Genus"] <- "taxname"
